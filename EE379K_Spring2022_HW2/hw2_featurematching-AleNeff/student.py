@@ -1,7 +1,10 @@
 import numpy as np
+import cv2
+import math
 import matplotlib.pyplot as plt
 from skimage import filters, feature, img_as_int
 from skimage.measure import regionprops
+from nonmax import non_max_suppression
 
 def plot_interest_points(image, x, y):
     '''
@@ -19,6 +22,9 @@ def plot_interest_points(image, x, y):
     '''
 
     # TODO: Your implementation here! See block comments and the handout pdf for instructions
+    plt.scatter(x,y,zorder=1, color = 'none', edgecolor='red')
+    plt.imshow(image, zorder=0, cmap='gray') # may need to use extent param
+    plt.show()
 
 def get_interest_points(image, feature_width):
     '''
@@ -80,6 +86,57 @@ def get_interest_points(image, feature_width):
     # BONUS: There are some ways to improve:
     # 1. Making interest point detection multi-scaled.
     # 2. Use adaptive non-maximum suppression.
+
+    sobelx = cv2.Sobel(image,ddepth=-1,dx=1,dy=0,ksize=3)
+    sobely = cv2.Sobel(image,ddepth=-1,dx=0,dy=1,ksize=3)
+    img_dx = cv2.filter2D(image, ddepth=-1, kernel = sobelx)
+    img_dy = cv2.filter2D(image, ddepth=-1, kernel = sobely)
+    img_ddx = cv2.filter2D(img_dx, ddepth=-1, kernel = sobelx)
+    img_ddy = cv2.filter2D(img_dy, ddepth=-1, kernel = sobely)
+    img_dxdy = cv2.filter2D(img_dy, ddepth=-1, kernel = sobelx)
+
+    # error here trying to use spatialGradient
+
+    # image = (image * 255).astype(np.uint8)
+    # img_dx, img_dy = cv2.spatialGradient(image, borderType=cv2.BORDER_REPLICATE)
+    # img_ddx = img_dx**2
+    # img_dxdy = img_dx * img_dy
+    # img_ddy = img_dy**2
+
+    # img_ddx, img_dxdy = cv2.spatialGradient(img_dx, borderType=cv2.BORDER_REPLICATE)
+    # img_dxdy, img_ddy = cv2.spatialGradient(img_dy, borderType=cv2.BORDER_REPLICATE)
+
+    M_mat = np.ndarray(shape = [image.shape[0], image.shape[1], 2, 2])
+    alpha = 0.04
+    for i in range(image.shape[0]):
+        for j in range(image.shape[1]):
+            M_mat[i][j][0][0] = img_ddx[i][j]
+            M_mat[i][j][0][1] = img_dxdy[i][j]
+            M_mat[i][j][1][0] = img_dxdy[i][j]
+            M_mat[i][j][1][1] = img_ddy[i][j]
+    
+    img_ddx = cv2.GaussianBlur(src=img_ddx, ksize=[3,3], sigmaX=1, sigmaY=1)
+    img_dxdy = cv2.GaussianBlur(src=img_dxdy, ksize=[3,3], sigmaX=1, sigmaY=1)
+    img_ddy = cv2.GaussianBlur(src=img_ddy, ksize=[3,3], sigmaX=1, sigmaY=1)
+    # plt.imshow(img_dxdy, cmap='gray')
+    # plt.show()
+
+    M_det = np.ndarray(image.shape)
+    M_trace = np.ndarray(image.shape)
+    C_mat = np.ndarray(image.shape)
+    for i in range(image.shape[0]):
+        for j in range(image.shape[1]):
+            M_det[i][j] = np.linalg.det(M_mat[i][j])
+            M_trace[i][j] = np.trace(M_mat[i][j])
+            C_mat[i][j] = M_det[i][j] - alpha * M_trace[i][j]
+
+    t = 0.0005
+    C_mat = C_mat * (C_mat > t)
+    peaks = feature.peak_local_max(C_mat, min_distance=int(feature_width/2), num_peaks = 1500, exclude_border=True)
+    #  threshold_abs=C_mat_med, threshold_rel=C_mat_med, 
+    peaks = np.array(peaks)
+    xs = peaks[:,1]
+    ys = peaks[:,0]
 
     return xs, ys
 
@@ -163,8 +220,56 @@ def get_features(image, x, y, feature_width):
     # 1. Use a multi-scaled feature descriptor.
     # 2. Borrow ideas from GLOH or other type of feature descriptors.
 
-    # This is a placeholder - replace this with your features!
-    features = np.zeros((len(x),128))
+    gray_img = image
+    # applying a gaussian filter seemed to help accuracy
+    g_filter = cv2.getGaussianKernel(3, 1)
+    gray_img = cv2.filter2D(gray_img, -1, g_filter)
+    features = np.ndarray(shape=[len(x), 256]).astype(np.float32)
+    s_x = np.asarray([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]]).astype(np.int64)
+    s_y = np.asarray([[1, 2, 1], [0, 0, 0], [-1, -2, -1]]).astype(np.int64)
+    angles = [0, 45, 90, 135, 180, 225, 270, 315]
+
+    filter_set = np.ndarray(shape=[len(angles), s_x.shape[0], s_x.shape[1]])
+    for i in range(len(angles)):
+        filter_set[i] = np.asarray(np.cos(np.deg2rad(angles[i])) * s_x + np.sin(np.deg2rad(angles[i])) * s_y)
+
+    oriented_imgs = [cv2.filter2D(gray_img, -1, filt) for filt in filter_set]
+    oriented_imgs = np.array(oriented_imgs)
+    # set of angle yielding highest gradient in image from oriented filters
+    grad_ori = np.ndarray(shape=gray_img.shape)
+    grad_mag = np.ndarray(shape=gray_img.shape)
+    for i in range(oriented_imgs.shape[1]):
+        for j in range(oriented_imgs.shape[2]):
+            max_grad_angle_arg = np.argmax(oriented_imgs[:,i,j])
+            grad_ori[i][j] = max_grad_angle_arg
+            grad_mag[i][j] = oriented_imgs[max_grad_angle_arg][i][j]
+
+# using approach #1 from Dr. Wang, where POI pixel is offset from center of feature box
+    for k in range(len(x)):
+        for i in range(-1, 3):
+            for j in range(-1, 3):
+                start_pixel_x = x[k] + 4*j
+                start_pixel_y = y[k] + 4*i
+                for u in range(0, 4):
+                    for v in range(0, 4):
+                        # compute bin, [0 - 7], for orientation
+                        chunk_start = (32 * (i+1)) + (8 * (j+1))
+                        # avoid out-of-bounds
+                        if start_pixel_y+u >= gray_img.shape[0] or start_pixel_x+v >= len(gray_img[1]): continue
+                        # non-SIFT intensity histograms approach that I used initially
+                        # features[k][chunk_start+v+4*u] = gray_img[start_pixel_y+u][start_pixel_x+v]
+                        bin_index = int(grad_ori[start_pixel_y + u][start_pixel_x + v])
+                        chunk_start = (32 * (i+1)) + (8 * (j+1))
+                        # approach if I wanted to add magnitude to bin instead of just increment by 1
+                        # features[k][chunk_start + bin_index] += grad_mag[start_pixel_y + u][start_pixel_x + v]
+                        features[k][chunk_start + bin_index] += 1
+        # features[k] = features[k] / np.linalg.norm(features[k])
+        # illumination-invariant normalization
+        features[k] = features[k] / np.max(features[k])
+        for f in range(len(features[k])):
+            if features[k][f] > 0.3:
+                features[k][f] = 0.3
+        features[k] = features[k] * (1/np.max(features[k]))
 
     return features
 
@@ -210,11 +315,42 @@ def match_features(im1_features, im2_features):
     
     # BONUS: Using PCA might help the speed (but maybe not the accuracy).
 
-    matches = np.zeros((1,2))
-    confidences = np.zeros(1)
+    matches = []
+    confidences = []
 
-    # n = # of interest points in im1, m = # of interest points in im2
-    mat_B = (im1_features*np.transpose(im2_features))*2
-    print(mat_B.shape)
+    mat_B = np.matmul(im1_features, np.transpose(im2_features)) * 2
+
+    mat_f1 = np.sum((im1_features*im1_features), axis=1)
+    mat_f2 = np.sum((im2_features*im2_features), axis=1)
+    mat_f1 = np.expand_dims(mat_f1, axis=1)
+    mat_f2 = np.expand_dims(mat_f2, axis=0)
+
+    mat_A = mat_f1 + mat_f2
+    mat_D = np.sqrt(mat_A-mat_B + 1e-9)
+    # print(mat_A.shape)
+    # print(mat_B.shape)
+    # print(mat_D)
+    
+    feat_dists_arg_sorted = np.argsort(mat_D, axis=1)
+    # now perform ratio test for each of n feature to the first two of the m features
+    RATIO_CUTOFF = 1
+
+    for i in range(feat_dists_arg_sorted.shape[0]):
+        ratio = mat_D[i][feat_dists_arg_sorted[i][0]] / mat_D[i][feat_dists_arg_sorted[i][1]]
+        if ratio < RATIO_CUTOFF:
+            coord_pair = [i, feat_dists_arg_sorted[i][0]]
+            matches.append(coord_pair)
+            # print(coord_pair)
+            confidences.append(1-ratio)
+    # matches_temp = [match for _, match in sorted(zip(confidences, matches), reverse=True)]
+    # confidences_temp = [conf for conf,_ in sorted(zip(confidences, matches), reverse=True)]
+    # matches = matches_temp
+    # confidences = confidences_temp
+
+    confidences = np.array(confidences)
+    conf_inds = np.flip(confidences.argsort())
+    matches = np.array(matches)[conf_inds]
+    confidences = np.array(confidences)[conf_inds]
+    # print(matches.shape)
 
     return matches, confidences
